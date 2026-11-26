@@ -200,6 +200,16 @@
             pointer-events: auto;
         }
 
+        #gesture-hint {
+            margin-top: 14px;
+            font-size: 10px;
+            letter-spacing: .18em;
+            color: rgba(255, 190, 208, .5);
+            opacity: 0;
+            transition: opacity .4s ease;
+            text-align: center;
+        }
+
         .gesture-row button {
             background: rgba(20, 0, 10, 0.45);
             border: 1px solid rgba(255, 105, 180, 0.25);
@@ -274,6 +284,9 @@
         <div class="gesture-row">
             <button id="gesture-btn" type="button">开启手势互动 / Hand Control</button>
         </div>
+
+        <!-- 手势反馈：让用户知道摄像头已经识别到动作 -->
+        <div id="gesture-hint">✋ 张开手掌 → 粒子散开　✊ 握拳 → 收回成树</div>
 
     </div>
 
@@ -804,74 +817,86 @@
             requestAnimationFrame(() => predictWebcam(video));
         }
 
+        // --- 手势判定 ---
+        // 用「指尖 / 指根相对手腕的距离」判断手指是否伸直：与手离摄像头的远近无关，
+        // 因此手在小画面里也能稳定区分「张开手掌」和「握拳」。
+        const G = { lastPose: '', stable: 0 };
+
+        function dist2(a, b) {
+            return Math.hypot(a.x - b.x, a.y - b.y);
+        }
+
+        function countExtended(lm) {
+            const pairs = [[8, 6], [12, 10], [16, 14], [20, 18]]; // 指尖 / 指根
+            let n = 0;
+            for (const [tip, pip] of pairs) {
+                if (dist2(lm[tip], lm[0]) > dist2(lm[pip], lm[0]) * 1.16) n++;
+            }
+            return n;
+        }
+
+        function showGestureHint(text, show) {
+            const el = document.getElementById('gesture-hint');
+            if (!el) return;
+            if (text) el.textContent = text;
+            el.style.opacity = show ? 1 : 0;
+        }
+
+        function setMode(mode, hint) {
+            STATE.mode = mode;
+            if (hint) showGestureHint(hint, true);
+        }
+
         function processGestures(result) {
             if (result.landmarks && result.landmarks.length > 0) {
                 STATE.hand.detected = true;
                 const lm = result.landmarks[0];
-                // 映射手部中心坐标到 -1 到 1
                 STATE.hand.x = (lm[9].x - 0.5) * 2;
                 STATE.hand.y = (lm[9].y - 0.5) * 2;
 
-                const thumb = lm[4]; const index = lm[8]; const wrist = lm[0];
-                // 计算捏合距离 (拇指指尖 - 食指指尖)
-                const pinchDist = Math.hypot(thumb.x - index.x, thumb.y - index.y);
-
-                // 计算张开程度 (所有指尖到手腕的平均距离)
-                const tips = [lm[8], lm[12], lm[16], lm[20]];
-                let avgDist = 0; tips.forEach(t => avgDist += Math.hypot(t.x - wrist.x, t.y - wrist.y));
-                avgDist /= 4;
-
-                const PINCH_START = 0.05; // 捏合阈值
-                const PINCH_RELEASE = 0.1; // 松开阈值
-
-                // === 交互逻辑 ===
-                // 1. 捏合手势：抓取照片
-                if (pinchDist < PINCH_START) {
+                // 双指捏合：抓取照片（有照片时才有意义）
+                const pinchDist = dist2(lm[4], lm[8]);
+                if (pinchDist < 0.05) {
                     if (!STATE.hand.isPinching) {
                         STATE.hand.isPinching = true;
-                        if (STATE.mode === 'SCATTER' || STATE.mode === 'FOCUS') {
-                            if (photoMeshes.length > 0) {
-                                // 如果之前有聚焦的对象，先归位
-                                if (STATE.focusTarget && STATE.mode === 'FOCUS') mainGroup.attach(STATE.focusTarget);
-                                STATE.mode = 'FOCUS';
-                                const idx = STATE.grabCount % photoMeshes.length; // 轮询照片
-                                STATE.focusTarget = photoMeshes[idx];
-                                STATE.grabCount++;
-                                scene.attach(STATE.focusTarget); // 将照片移出主组，独立控制
-                            }
+                        if ((STATE.mode === 'SCATTER' || STATE.mode === 'FOCUS') && photoMeshes.length > 0) {
+                            if (STATE.focusTarget && STATE.mode === 'FOCUS') mainGroup.attach(STATE.focusTarget);
+                            STATE.mode = 'FOCUS';
+                            const idx = STATE.grabCount % photoMeshes.length;
+                            STATE.focusTarget = photoMeshes[idx];
+                            STATE.grabCount++;
+                            scene.attach(STATE.focusTarget);
                         }
                     }
-                } else if (pinchDist > PINCH_RELEASE) {
+                } else if (pinchDist > 0.1) {
                     STATE.hand.isPinching = false;
                 }
 
-                // 2. 握拳手势：切换场景模式
-                if (avgDist < 0.25) {
-                    if (STATE.mode !== 'TREE' && STATE.mode !== 'PROPOSAL') {
-                        // 释放当前聚焦照片
-                        if (STATE.focusTarget && STATE.mode === 'FOCUS') { mainGroup.attach(STATE.focusTarget); STATE.focusTarget = null; }
+                if (STATE.hand.isPinching) return; // 捏合中不做张合判定
 
-                        if (STATE.storyStage === 0) {
-                            STATE.mode = 'PROPOSAL';
-                            STATE.storyStage = 1;
-                            updateTitle("Flower For You");
-                        } else {
-                            STATE.mode = 'TREE';
-                            STATE.storyStage = 0;
-                            updateTitle("Merry Christmas");
-                        }
-                        STATE.hand.isPinching = false;
-                    }
-                }
-                // 3. 张开手掌：散开粒子
-                else if (avgDist > 0.45 && !STATE.hand.isPinching) {
-                    if (STATE.mode !== 'SCATTER') {
+                const ext = countExtended(lm);
+                let pose = 'none';
+                if (ext >= 4) pose = 'open';
+                else if (ext <= 1) pose = 'fist';
+
+                if (pose === G.lastPose) G.stable++;
+                else { G.lastPose = pose; G.stable = 1; }
+
+                // 连续 3 帧同一姿态才触发，避免抖动误判
+                if (G.stable >= 3) {
+                    if (pose === 'open' && STATE.mode !== 'SCATTER') {
+                        if (STATE.focusTarget) { mainGroup.attach(STATE.focusTarget); STATE.focusTarget = null; }
+                        setMode('SCATTER', '✋ 已散开 · 握拳收回成树');
+                    } else if (pose === 'fist' && STATE.mode !== 'TREE') {
                         if (STATE.focusTarget && STATE.mode === 'FOCUS') { mainGroup.attach(STATE.focusTarget); STATE.focusTarget = null; }
-                        STATE.mode = 'SCATTER';
+                        setMode('TREE', '✊ 已收拢 · 张开手掌散开');
                     }
                 }
             } else {
-                STATE.hand.detected = false; STATE.hand.isPinching = false;
+                STATE.hand.detected = false;
+                STATE.hand.isPinching = false;
+                G.lastPose = '';
+                G.stable = 0;
             }
         }
 
@@ -907,7 +932,7 @@
                 // 如果两次点击间隔小于 300ms，且不是误触 (大于0)
                 if (tapLength < 300 && tapLength > 0) {
                     // 切换显示状态
-                    wrapper.classList.toggle('active');
+                    document.querySelector('.upload-wrapper').classList.toggle('active');
                     // 阻止默认的双击放大行为
                     e.preventDefault();
                 }
@@ -919,6 +944,11 @@
                 if (e.key.toLowerCase() === 'h') {
                     const wrapper = document.querySelector('.upload-wrapper');
                     wrapper.classList.toggle('active');
+                }
+                // 'P' 彩蛋：粒子聚成人形（求婚造型），再按回到圣诞树
+                if (e.key.toLowerCase() === 'p') {
+                    if (STATE.mode === 'PROPOSAL') { setMode('TREE', '✊ 已收拢成树'); }
+                    else { setMode('PROPOSAL', '🌹 彩蛋造型 · 按 P 回到圣诞树'); }
                 }
             });
         }
@@ -941,8 +971,8 @@
                 STATE.rotation.y = Math.sin(clock.elapsedTime * 0.5) * 0.2; // 缓慢摆动
                 STATE.rotation.x = THREE.MathUtils.lerp(STATE.rotation.x, 0, dt);
             }
-            else if (STATE.mode === 'SCATTER' && STATE.hand.detected) {
-                // 手势控制视角旋转
+            else if (STATE.hand.detected && STATE.mode !== 'PROPOSAL') {
+                // 手在画面里时，视角跟着手走：挥手即转，不用等形态切换
                 const targetRotY = STATE.hand.x * Math.PI * 0.9;
                 const targetRotX = STATE.hand.y * Math.PI * 0.25;
                 STATE.rotation.y += (targetRotY - STATE.rotation.y) * 3.0 * dt;
@@ -977,6 +1007,7 @@
                     await initMediaPipe();
                     btn.textContent = '手势已开启 ✓';
                     document.getElementById('webcam-wrapper').style.opacity = 1;
+                    showGestureHint('✋ 张开手掌 → 粒子散开　✊ 握拳 → 收回成树', true);
                 } catch (e) {
                     console.warn('手势识别不可用：', e);
                     btn.disabled = false;
